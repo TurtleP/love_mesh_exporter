@@ -1,4 +1,5 @@
 import struct
+from pathlib import Path
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty
@@ -15,6 +16,55 @@ bl_info = {
     "category": "Import-Export",
 }
 
+VERTEX = struct.Struct("<fffffffff")  # pos.xyz, uv.xy, color.rgba
+
+HEADER = struct.Struct("<3sIIII")
+HEADER_MAGIC = b"MSH"
+
+
+def axis_vector(axis: str) -> Vector:
+    sign = -1 if axis.startswith("-") else 1
+    axis = axis[-1]
+    return {
+        "X": Vector((sign, 0, 0)),
+        "Y": Vector((0, sign, 0)),
+        "Z": Vector((0, 0, sign)),
+    }[axis]
+
+
+def build_axis_matrix(forward: str, up: str) -> Matrix:
+    fwd = axis_vector(forward)
+    upv = axis_vector(up)
+    right = fwd.cross(upv)
+
+    return Matrix((right, upv, fwd)).transposed()
+
+
+def get_mesh_textures(obj):
+    textures = list()
+
+    for slot in obj.material_slots:
+        material = slot.material
+        if not material or not material.use_nodes:
+            continue
+
+        tree_nodes = material.node_tree.nodes
+        node = next((n for n in tree_nodes if n.type == "TEX_IMAGE"), None)
+        filepath = Path(bpy.path.abspath(node.image.filepath)).resolve()
+        display_name = bpy.path.display_name(filepath.as_posix())
+        textures.append((display_name, filepath.name))
+
+    return textures
+
+
+def texture_items(self, context):
+    obj = context.active_object
+    if not obj or obj.type != "MESH":
+        return []
+
+    textures = get_mesh_textures(obj)
+    return [(filepath, display_name, "") for (display_name, filepath) in textures]
+
 
 class ExportLoveMesh(bpy.types.Operator, ExportHelper):
     bl_idname = "export_mesh.love_mesh"
@@ -26,95 +76,73 @@ class ExportLoveMesh(bpy.types.Operator, ExportHelper):
 
     export_forward: EnumProperty(
         name="Forward",
-        items=[
-            ("X", "X", ""),
-            ("Y", "Y", ""),
-            ("Z", "Z", ""),
-            ("-X", "-X", ""),
-            ("-Y", "-Y", ""),
-            ("-Z", "-Z", ""),
-        ],
+        items=[(a, a, "") for a in ("X", "Y", "Z", "-X", "-Y", "-Z")],
         default="Y",
     )
 
     export_up: EnumProperty(
         name="Up",
-        items=[
-            ("X", "X", ""),
-            ("Y", "Y", ""),
-            ("Z", "Z", ""),
-            ("-X", "-X", ""),
-            ("-Y", "-Y", ""),
-            ("-Z", "-Z", ""),
-        ],
+        items=[(a, a, "") for a in ("X", "Y", "Z", "-X", "-Y", "-Z")],
         default="Z",
     )
 
-    def axis_vector(self, axis) -> Vector:
-        sign = -1 if axis.startswith("-") else 1
-        axis = axis[-1]
-        if axis == "X":
-            return Vector((sign, 0, 0))
-        if axis == "Y":
-            return Vector((0, sign, 0))
-        if axis == "Z":
-            return Vector((0, 0, sign))
+    export_texture: EnumProperty(name="Texture", items=texture_items)
 
-    def export_position(self, pos):
-        fwd = self.axis_vector(self.export_forward)
-        up = self.axis_vector(self.export_up)
+    def get_uv(self, layer, index):
+        if not layer:
+            return 0.0, 0.0
 
-        right = fwd.cross(up)
+        u, v = layer.data[index].uv
+        if self.flip_uv_u:
+            u = 1.0 - u
+        if self.flip_uv_v:
+            v = 1.0 - v
+        return u, v
 
-        mat = Matrix(
-            (
-                right,
-                up,
-                fwd,
-            )
-        ).transposed()
-
-        return mat @ pos
-
-    def get_uvs(self, layer, index) -> list[float]:
-        if layer is not None:
-            u, v = layer.data[index].uv
-            if self.flip_uv_u:
-                u = 1.0 - u
-            if self.flip_uv_v:
-                v = 1.0 - v
-            return [u, v]
-        return [0.0, 0.0]
-
-    def get_color(self, layer, index) -> list[float]:
-        if layer is not None:
-            return layer.data[index].color
-        return [1.0, 1.0, 1.0, 1.0]
+    def get_color(self, layer, index):
+        if not layer:
+            return 1.0, 1.0, 1.0, 1.0
+        return tuple(layer.data[index].color)
 
     def execute(self, context):
-        obj = bpy.context.active_object
+        obj = context.active_object
         if not obj or obj.type != "MESH":
-            raise RuntimeError("Select a mesh object")
+            self.report({"ERROR"}, "Select a mesh object")
+            return {"CANCELLED"}
 
         mesh = obj.to_mesh()
         mesh.calc_loop_triangles()
 
-        out = bytearray()
-        VERTEX_FMT = "<fffffffff"  # xyz uv rgba
-
+        axis_matrix = build_axis_matrix(self.export_forward, self.export_up)
         uv_layer = mesh.uv_layers.active
         color_layer = mesh.vertex_colors.active
+
+        vertex_size = struct.calcsize(VERTEX.format)
+        vertex_count = sum(len(tri.loops) for tri in mesh.loop_triangles)
+
+        filepath_len = len(self.export_texture)
+
+        out = bytearray()
+
+        header_size = struct.calcsize(HEADER.format)
+        out += HEADER.pack(
+            HEADER_MAGIC, vertex_count, vertex_size, filepath_len, header_size
+        )
 
         for tri in mesh.loop_triangles:
             for loop_index in tri.loops:
                 loop = mesh.loops[loop_index]
                 vert = mesh.vertices[loop.vertex_index]
 
-                pos = self.export_position(vert.co)
-                u, v = self.get_uvs(uv_layer, loop_index)
-                r, g, b, a = self.get_color(color_layer, loop_index)
-                out += struct.pack(VERTEX_FMT, pos.x, pos.y, pos.z, u, v, r, g, b, a)
+                pos = axis_matrix @ vert.co
+                uv = self.get_uv(uv_layer, loop_index)
+                color = self.get_color(color_layer, loop_index)
 
+                out += VERTEX.pack(*pos, *uv, *color)
+
+        out += struct.pack(f"<{filepath_len}s", bytes(self.export_texture, "utf-8"))
+
+        obj.to_mesh_clear()
         with open(self.filepath, "wb") as f:
             f.write(out)
 
@@ -133,6 +161,7 @@ class ExportLoveMesh(bpy.types.Operator, ExportHelper):
         layout.label(text="Export Options")
         layout.prop(self, "export_forward")
         layout.prop(self, "export_up")
+        layout.prop(self, "export_texture")
 
 
 def menu_func_export(self, context):
