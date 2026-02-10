@@ -9,17 +9,42 @@ from mathutils import Matrix, Vector
 bl_info = {
     "name": "LÖVE Mesh Binary Exporter",
     "author": "TurtleP",
-    "version": (1, 0),
+    "version": (1, 1),
     "blender": (3, 0, 0),
     "location": "File > Export",
     "description": "Export a mesh as a flat binary for a LÖVE Mesh",
     "category": "Import-Export",
 }
 
-VERTEX = struct.Struct("<fffffffff")  # pos.xyz, uv.xy, color.rgba
+# ---------------------------
+# GPU attribute definitions
+# ---------------------------
+DATAFORMAT = {
+    "FLOAT_VEC2": 1,
+    "FLOAT_VEC3": 2,
+    "FLOAT_VEC4": 3,
+}
 
-HEADER = struct.Struct("<3sIIII")
-HEADER_MAGIC = b"MSH"
+ATTRIBUTE = {
+    "VertexPosition": 0,
+    "VertexTexCoord": 1,
+    "VertexColor": 2,
+}
+
+# Central attribute table: name -> (semantic, DataFormat, struct format)
+ATTRIBUTE_TABLE = {
+    "VertexPosition": (ATTRIBUTE["VertexPosition"], DATAFORMAT["FLOAT_VEC3"], "fff", 0),
+    "VertexTexCoord": (ATTRIBUTE["VertexTexCoord"], DATAFORMAT["FLOAT_VEC2"], "ff", 1),
+    "VertexColor": (ATTRIBUTE["VertexColor"], DATAFORMAT["FLOAT_VEC4"], "ffff", 2),
+}
+
+# ---------------------------
+# Struct definitions
+# ---------------------------
+
+HEADER_MAGIC = b"MSH0"
+HEADER_STRUCT = struct.Struct("<4sIIIII")   # magic, vertex_count, stride, texture_name_len, attribute_count, size
+ATTRIBUTE_STRUCT = struct.Struct("<BBB")   # semantic, dataformat, offset
 
 
 def axis_vector(axis: str) -> Vector:
@@ -38,6 +63,18 @@ def build_axis_matrix(forward: str, up: str) -> Matrix:
     right = fwd.cross(upv)
 
     return Matrix((right, upv, fwd)).transposed()
+
+
+def build_attribute_layout():
+    """Compute offsets and total stride based on ATTRIBUTE_TABLE."""
+    layout = []
+    offset = 0
+    for name, (semantic, dataformat, fmt, location) in ATTRIBUTE_TABLE.items():
+        size = struct.calcsize("<" + fmt)
+        layout.append((name, semantic, dataformat, location, fmt))
+        offset += size
+    return layout, offset
+
 
 
 def get_mesh_textures(obj):
@@ -65,43 +102,40 @@ def texture_items(self, context):
     textures = get_mesh_textures(obj)
     return [(filepath, display_name, "") for (display_name, filepath) in textures]
 
+AXIS_DATA = ("X", "Y", "Z", "-X", "-Y", "-Z")
+ENDIANS = (("Little", "<"), ("Big", ">"))
 
 class ExportLoveMesh(bpy.types.Operator, ExportHelper):
     bl_idname = "export_mesh.love_mesh"
     bl_label = "Export MSH"
     filename_ext = ".msh"
 
-    flip_uv_u: BoolProperty(name="Flip UV U", description="Flip UV U", default=False)
-    flip_uv_v: BoolProperty(name="Flip UV V", description="Flip UV V", default=False)
+    flip_uv_u: BoolProperty(name="Flip UV U", description="Flip UV U", default=False) # type: ignore
+    flip_uv_v: BoolProperty(name="Flip UV V", description="Flip UV V", default=False) # type: ignore
 
-    export_forward: EnumProperty(
-        name="Forward",
-        items=[(a, a, "") for a in ("X", "Y", "Z", "-X", "-Y", "-Z")],
-        default="Y",
-    )
+    forward_axis: EnumProperty(name="Forward", items=[(axis, axis, "") for axis in AXIS_DATA], default="Y") # type: ignore
+    up_axis: EnumProperty(name="Up", items=[(axis, axis, "") for axis in AXIS_DATA], default="Z") # type: ignore
 
-    export_up: EnumProperty(
-        name="Up",
-        items=[(a, a, "") for a in ("X", "Y", "Z", "-X", "-Y", "-Z")],
-        default="Z",
-    )
+    texture_name: EnumProperty(name="Texture", items=texture_items) # type: ignore
+    endian: EnumProperty(name="Vertex Endian", items=[(format, endian_type, "") for (endian_type, format) in ENDIANS], default="<") # type: ignore
 
-    export_texture: EnumProperty(name="Texture", items=texture_items)
-
-    def get_uv(self, layer, index):
+    def get_uv(self, layer, index) -> tuple[float, float]:
         if not layer:
-            return 0.0, 0.0
+            return (0.0, 0.0)
 
         u, v = layer.data[index].uv
         if self.flip_uv_u:
             u = 1.0 - u
+
         if self.flip_uv_v:
             v = 1.0 - v
-        return u, v
 
-    def get_color(self, layer, index):
+        return (u, v)
+
+    def get_color(self, layer, index) -> tuple[float, float, float, float]:
         if not layer:
-            return 1.0, 1.0, 1.0, 1.0
+            return (1.0, 1.0, 1.0, 1.0)
+
         return tuple(layer.data[index].color)
 
     def execute(self, context):
@@ -113,21 +147,22 @@ class ExportLoveMesh(bpy.types.Operator, ExportHelper):
         mesh = obj.to_mesh()
         mesh.calc_loop_triangles()
 
-        axis_matrix = build_axis_matrix(self.export_forward, self.export_up)
+        axis_matrix = build_axis_matrix(self.forward_axis, self.up_axis)
         uv_layer = mesh.uv_layers.active
         color_layer = mesh.vertex_colors.active
 
-        vertex_size = struct.calcsize(VERTEX.format)
+        layout, stride = build_attribute_layout()
         vertex_count = sum(len(tri.loops) for tri in mesh.loop_triangles)
 
-        filepath_len = len(self.export_texture)
-
         out = bytearray()
+        header_size = struct.calcsize(HEADER_STRUCT.format)
 
-        header_size = struct.calcsize(HEADER.format)
-        out += HEADER.pack(
-            HEADER_MAGIC, vertex_count, vertex_size, filepath_len, header_size
-        )
+        texture_name = self.texture_name.encode("utf-8")
+        out += HEADER_STRUCT.pack(HEADER_MAGIC, vertex_count, stride, len(texture_name), len(layout), header_size)
+
+        # Attribute table
+        for _, semantic, dataformat, location, _ in layout:
+            out += ATTRIBUTE_STRUCT.pack(semantic, dataformat, location)
 
         for tri in mesh.loop_triangles:
             for loop_index in tri.loops:
@@ -138,9 +173,17 @@ class ExportLoveMesh(bpy.types.Operator, ExportHelper):
                 uv = self.get_uv(uv_layer, loop_index)
                 color = self.get_color(color_layer, loop_index)
 
-                out += VERTEX.pack(*pos, *uv, *color)
+                for _, semantic, _, _, format in layout:
+                    struct_pack_format = f"{self.endian}{format}"
+                    if semantic == ATTRIBUTE["VertexPosition"]:
+                        out += struct.pack(struct_pack_format, pos.x, pos.y, pos.z)
+                    elif semantic == ATTRIBUTE["VertexTexCoord"]:
+                        out += struct.pack(struct_pack_format, *uv)
+                    elif semantic == ATTRIBUTE["VertexColor"]:
+                        out += struct.pack(struct_pack_format, *color)
 
-        out += struct.pack(f"<{filepath_len}s", bytes(self.export_texture, "utf-8"))
+        if len(texture_name):
+            out += struct.pack(f"<{len(texture_name)}s", texture_name)
 
         obj.to_mesh_clear()
         with open(self.filepath, "wb") as f:
@@ -159,9 +202,10 @@ class ExportLoveMesh(bpy.types.Operator, ExportHelper):
         layout.separator()
 
         layout.label(text="Export Options")
-        layout.prop(self, "export_forward")
-        layout.prop(self, "export_up")
-        layout.prop(self, "export_texture")
+        layout.prop(self, "forward_axis")
+        layout.prop(self, "up_axis")
+        layout.prop(self, "texture_name")
+        layout.prop(self, "endian")
 
 
 def menu_func_export(self, context):
