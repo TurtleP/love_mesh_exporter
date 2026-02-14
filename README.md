@@ -40,8 +40,9 @@ struct Header
     char magic[4];             //< MSH0
     uint32_t vertex_count;     //< Number of vertices
     uint32_t vertex_stride;    //< Size of each vertex
-    uint32_t texture_name_len; //< Texture name length
     uint32_t attribute_count;  //< Number of attributes
+    uint32_t attribute_stride; //< Size of each attribute
+    uint32_t texture_name_len; //< Texture name length
     uint32_t header_size;      //< Total header size
 };
 

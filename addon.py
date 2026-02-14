@@ -43,7 +43,7 @@ ATTRIBUTE_TABLE = {
 # ---------------------------
 
 HEADER_MAGIC = b"MSH0"
-HEADER_STRUCT = struct.Struct("<4sIIIII")   # magic, vertex_count, stride, texture_name_len, attribute_count, size
+HEADER_STRUCT = struct.Struct("<4sIIIIII")   # magic, vertex_count, stride, attribute_count, attr_struct_size, texture_name_len, , size
 ATTRIBUTE_STRUCT = struct.Struct("<BBB")   # semantic, dataformat, offset
 
 
@@ -158,7 +158,8 @@ class ExportLoveMesh(bpy.types.Operator, ExportHelper):
         header_size = struct.calcsize(HEADER_STRUCT.format)
 
         texture_name = self.texture_name.encode("utf-8")
-        out += HEADER_STRUCT.pack(HEADER_MAGIC, vertex_count, stride, len(texture_name), len(layout), header_size)
+        attributes_size = struct.calcsize(ATTRIBUTE_STRUCT.format)
+        out += HEADER_STRUCT.pack(HEADER_MAGIC, vertex_count, stride, len(layout), attributes_size, len(texture_name), header_size)
 
         # Attribute table
         for _, semantic, dataformat, location, _ in layout:
