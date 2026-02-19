@@ -43,8 +43,8 @@ ATTRIBUTE_TABLE = {
 # ---------------------------
 
 HEADER_MAGIC = b"MSH0"
-HEADER_STRUCT = struct.Struct("<4sIIIIII")   # magic, vertex_count, stride, attribute_count, attr_struct_size, texture_name_len, , size
-ATTRIBUTE_STRUCT = struct.Struct("<BBB")   # semantic, dataformat, offset
+HEADER_FORMAT = "4sIIIIII"   # magic, vertex_count, stride, attribute_count, attr_struct_size, texture_name_len, , size
+ATTRIBUTE_FORMAT = "BBB"   # semantic, dataformat, offset
 
 
 def axis_vector(axis: str) -> Vector:
@@ -117,7 +117,7 @@ class ExportLoveMesh(bpy.types.Operator, ExportHelper):
     up_axis: EnumProperty(name="Up", items=[(axis, axis, "") for axis in AXIS_DATA], default="Z") # type: ignore
 
     texture_name: EnumProperty(name="Texture", items=texture_items) # type: ignore
-    endian: EnumProperty(name="Vertex Endian", items=[(format, endian_type, "") for (endian_type, format) in ENDIANS], default="<") # type: ignore
+    endian: EnumProperty(name="Endianness", items=[(format, endian_type, "") for (endian_type, format) in ENDIANS], default="<") # type: ignore
 
     def get_uv(self, layer, index) -> tuple[float, float]:
         if not layer:
@@ -155,15 +155,15 @@ class ExportLoveMesh(bpy.types.Operator, ExportHelper):
         vertex_count = sum(len(tri.loops) for tri in mesh.loop_triangles)
 
         out = bytearray()
-        header_size = struct.calcsize(HEADER_STRUCT.format)
+        header_size = struct.calcsize(HEADER_FORMAT)
 
         texture_name = self.texture_name.encode("utf-8")
-        attributes_size = struct.calcsize(ATTRIBUTE_STRUCT.format)
-        out += HEADER_STRUCT.pack(HEADER_MAGIC, vertex_count, stride, len(layout), attributes_size, len(texture_name), header_size)
+        attributes_size = struct.calcsize(ATTRIBUTE_FORMAT)
+        out += struct.pack(f"{self.endian}{HEADER_FORMAT}", HEADER_MAGIC, vertex_count, stride, len(layout), attributes_size, len(texture_name), header_size)
 
         # Attribute table
         for _, semantic, dataformat, location, _ in layout:
-            out += ATTRIBUTE_STRUCT.pack(semantic, dataformat, location)
+            out += struct.pack(f"{self.endian}{ATTRIBUTE_FORMAT}", semantic, dataformat, location)
 
         for tri in mesh.loop_triangles:
             for loop_index in tri.loops:
